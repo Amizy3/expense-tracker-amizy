@@ -32,6 +32,7 @@
   /* ---------------- Storage ---------------- */
   const STORE_KEY = 'hb_transactions_v1';
   const SETTINGS_KEY = 'hb_settings_v1';
+  const TASKS_KEY = 'hb_tasks_v1';
 
   const Store = {
     load() {
@@ -43,6 +44,16 @@
     },
     save(list) {
       localStorage.setItem(STORE_KEY, JSON.stringify(list));
+    },
+    loadTasks() {
+      try {
+        return JSON.parse(localStorage.getItem(TASKS_KEY)) || [];
+      } catch (e) {
+        return [];
+      }
+    },
+    saveTasks(list) {
+      localStorage.setItem(TASKS_KEY, JSON.stringify(list));
     },
     loadSettings() {
       try {
@@ -61,6 +72,7 @@
 
   let transactions = Store.load();
   let settings = Store.loadSettings();
+  let tasks = Store.loadTasks();
 
   const CURRENCIES = {
     USD: '$', EUR: '€', GBP: '£', EGP: 'E£', SAR: '﷼', AED: 'د.إ', INR: '₹', JPY: '¥', CAD: '$', AUD: '$',
@@ -340,6 +352,66 @@
     });
   }
 
+  /* ================= RENDER: TASKS ================= */
+  function renderTasks() {
+    const active = tasks.filter((t) => !t.done).sort((a, b) => a.createdAt - b.createdAt);
+    const done = tasks.filter((t) => t.done).sort((a, b) => b.createdAt - a.createdAt);
+
+    const row = (t) => `
+      <div class="task-item ${t.done ? 'done' : ''}" data-id="${t.id}">
+        <div class="task-check" data-action="toggle">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+        </div>
+        <div class="task-text" data-action="toggle">${escapeHtml(t.text)}</div>
+        <button class="task-del" data-action="delete" aria-label="Delete task">${trashIconSmall()}</button>
+      </div>`;
+
+    const body = tasks.length
+      ? `
+        <div class="task-list">${active.map(row).join('')}</div>
+        ${done.length ? `<div class="section-title">Completed (${done.length})</div><div class="task-list">${done.map(row).join('')}</div>` : ''}
+      `
+      : emptyState('✅', 'No tasks yet — add your first one above');
+
+    $('#tasks-view').innerHTML = `
+      <div class="task-add-row">
+        <input type="text" id="task-input" placeholder="Add a task..." maxlength="120">
+        <button id="task-add-btn" aria-label="Add task">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      ${body}
+    `;
+
+    const input = $('#task-input');
+    const submit = () => {
+      const text = input.value.trim();
+      if (!text) return;
+      tasks.push({ id: uid(), text, done: false, createdAt: Date.now() });
+      Store.saveTasks(tasks);
+      renderTasks();
+    };
+    $('#task-add-btn').onclick = submit;
+    input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+
+    $('#tasks-view').querySelectorAll('.task-item').forEach((el) => {
+      const id = el.dataset.id;
+      el.querySelectorAll('[data-action="toggle"]').forEach((t) => {
+        t.onclick = () => {
+          const task = tasks.find((x) => x.id === id);
+          task.done = !task.done;
+          Store.saveTasks(tasks);
+          renderTasks();
+        };
+      });
+      el.querySelector('[data-action="delete"]').onclick = () => {
+        tasks = tasks.filter((x) => x.id !== id);
+        Store.saveTasks(tasks);
+        renderTasks();
+      };
+    });
+  }
+
   /* ================= RENDER: SETTINGS ================= */
   function renderSettings() {
     const total = transactions.length;
@@ -538,6 +610,7 @@
   function downloadIcon() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>'; }
   function uploadIcon() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M7 14l5-5 5 5"/><path d="M5 3h14"/></svg>'; }
   function trashIcon() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--red)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
+  function trashIconSmall() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
 
   /* ================= Navigation ================= */
   function setView(v) {
@@ -545,13 +618,16 @@
     document.querySelectorAll('.view').forEach((el) => el.classList.remove('active'));
     $('#' + v + '-view').classList.add('active');
     document.querySelectorAll('nav.bottom-nav button').forEach((b) => b.classList.toggle('active', b.dataset.view === v));
+    $('#fab-add').style.display = v === 'tasks' ? 'none' : 'flex';
     if (v === 'home') renderHome();
+    if (v === 'tasks') renderTasks();
     if (v === 'history') renderHistory();
     if (v === 'settings') renderSettings();
   }
 
   function renderAll() {
     renderHome();
+    renderTasks();
     renderHistory();
     renderSettings();
   }
