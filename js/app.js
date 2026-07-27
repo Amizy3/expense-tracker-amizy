@@ -33,6 +33,7 @@
   const STORE_KEY = 'hb_transactions_v1';
   const SETTINGS_KEY = 'hb_settings_v1';
   const TASKS_KEY = 'hb_tasks_v1';
+  const RECURRING_KEY = 'hb_recurring_v1';
 
   const Store = {
     load() {
@@ -55,6 +56,16 @@
     saveTasks(list) {
       localStorage.setItem(TASKS_KEY, JSON.stringify(list));
     },
+    loadRecurring() {
+      try {
+        return JSON.parse(localStorage.getItem(RECURRING_KEY)) || [];
+      } catch (e) {
+        return [];
+      }
+    },
+    saveRecurring(list) {
+      localStorage.setItem(RECURRING_KEY, JSON.stringify(list));
+    },
     loadSettings() {
       try {
         return Object.assign(
@@ -73,6 +84,7 @@
   let transactions = Store.load();
   let settings = Store.loadSettings();
   let tasks = Store.loadTasks();
+  let recurring = Store.loadRecurring();
 
   const CURRENCIES = {
     USD: '$', EUR: '€', GBP: '£', EGP: 'E£', SAR: '﷼', AED: 'د.إ', INR: '₹', JPY: '¥', CAD: '$', AUD: '$',
@@ -116,6 +128,78 @@
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
   }
 
+  function isoFromDate(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+
+  function formatShortDate(dateStr) {
+    const d = new Date(dateStr + 'T00:00:00');
+    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  }
+
+  const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  function freqLabel(rule) {
+    return rule.frequency === 'monthly'
+      ? `Monthly on day ${rule.dayOfMonth}`
+      : `Weekly on ${WEEKDAY_NAMES[rule.weekday]}`;
+  }
+
+  /* ---------------- Recurring engine ---------------- */
+  function nextOccurrence(rule, fromDateStr) {
+    if (rule.frequency === 'monthly') {
+      const [y, m] = fromDateStr.split('-').map(Number);
+      const total = m; // (m - 1) zero-based months elapsed, plus 1 to advance a month
+      const ny = y + Math.floor(total / 12);
+      const nm = ((total % 12) + 12) % 12;
+      const dim = new Date(ny, nm + 1, 0).getDate();
+      const day = Math.min(rule.dayOfMonth, dim);
+      return `${ny}-${String(nm + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    }
+    const d = new Date(fromDateStr + 'T00:00:00');
+    d.setDate(d.getDate() + 7);
+    return isoFromDate(d);
+  }
+
+  function runRecurringEngine() {
+    const today = todayISO();
+    let generated = 0;
+    recurring.forEach((rule) => {
+      if (!rule.active) return;
+      let guard = 0;
+      let next = nextOccurrence(rule, rule.lastRun);
+      while (next <= today && guard < 60) {
+        transactions.push({
+          id: uid(),
+          type: rule.type,
+          amount: rule.amount,
+          category: rule.category,
+          date: next,
+          note: rule.note,
+          createdAt: Date.now(),
+          recurringId: rule.id,
+        });
+        rule.lastRun = next;
+        generated++;
+        guard++;
+        next = nextOccurrence(rule, rule.lastRun);
+      }
+    });
+    if (generated > 0) {
+      Store.save(transactions);
+      Store.saveRecurring(recurring);
+    }
+    return generated;
+  }
+
+  function upcomingRecurring(limit) {
+    return recurring
+      .filter((r) => r.active)
+      .map((r) => ({ rule: r, date: nextOccurrence(r, r.lastRun) }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .slice(0, limit);
+  }
+
   /* ---------------- State ---------------- */
   const state = {
     view: 'home',
@@ -126,6 +210,8 @@
     editingId: null,
     formType: 'expense',
     formCat: EXPENSE_CATEGORIES[0].id,
+    formRepeat: 'none',
+    openSheetEl: null,
   };
 
   /* ---------------- DOM refs ---------------- */
@@ -213,6 +299,26 @@
       .sort((a, b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt))
       .slice(0, 5);
 
+    let upcomingBlock = '';
+    if (isCurrentMonth) {
+      const items = upcomingRecurring(4);
+      if (items.length) {
+        const rows = items
+          .map(({ rule, date }) => {
+            const cat = CAT_BY_ID[rule.category] || { name: rule.category, emoji: '➕' };
+            return `
+              <div class="cat-row">
+                <div class="cat-row-top" style="margin-bottom:0;">
+                  <div class="cat-name"><span class="cat-emoji">${cat.emoji}</span>${cat.name} <span style="color:var(--text-dim);font-weight:500;">· ${formatShortDate(date)}</span></div>
+                  <div class="cat-amount">${rule.type === 'income' ? '+' : '-'}${fmt(rule.amount)}</div>
+                </div>
+              </div>`;
+          })
+          .join('');
+        upcomingBlock = `<div class="section-title">Upcoming</div><div class="cat-list">${rows}</div>`;
+      }
+    }
+
     $('#home-view').innerHTML = `
       <div class="month-switch">
         <button class="icon-btn" id="home-prev">${chevronLeft()}</button>
@@ -242,6 +348,8 @@
 
       ${insight ? `<div style="margin-top:14px;">${insight}</div>` : ''}
 
+      ${upcomingBlock}
+
       <div class="section-title">6-Month Trend</div>
       <div class="trend-chart">${trendCols}</div>
 
@@ -268,9 +376,10 @@
     const cat = CAT_BY_ID[t.category] || { name: t.category, emoji: '➕' };
     const d = new Date(t.date + 'T00:00:00');
     const dayLabel = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' });
+    const repeatBadge = t.recurringId ? '<span class="tx-repeat-badge" title="Recurring">↻</span>' : '';
     return `
       <div class="tx-item" data-id="${t.id}">
-        <div class="tx-icon">${cat.emoji}</div>
+        <div class="tx-icon">${cat.emoji}${repeatBadge}</div>
         <div class="tx-mid">
           <div class="tx-cat">${cat.name}</div>
           <div class="tx-note">${t.note ? escapeHtml(t.note) : dayLabel}</div>
@@ -427,6 +536,10 @@
           <div class="label-block"><div class="t">Monthly savings goal</div><div class="d">Shown as progress on Home</div></div>
           <input type="number" id="set-goal" min="0" step="1" value="${settings.goal || ''}" placeholder="0">
         </div>
+        <div class="settings-row" id="recurring-row">
+          <div class="label-block"><div class="t">Recurring expenses</div><div class="d">${recurring.filter((r) => r.active).length} active · manage repeats</div></div>
+          <span>${repeatIconSmall()}</span>
+        </div>
         <div class="settings-row" id="export-row">
           <div class="label-block"><div class="t">Export backup</div><div class="d">${total} transaction${total === 1 ? '' : 's'} · save as JSON file</div></div>
           <span>${downloadIcon()}</span>
@@ -448,6 +561,7 @@
 
     $('#set-currency').onchange = (e) => { settings.currency = e.target.value; Store.saveSettings(settings); renderAll(); };
     $('#set-goal').onchange = (e) => { settings.goal = parseFloat(e.target.value) || 0; Store.saveSettings(settings); };
+    $('#recurring-row').onclick = openRecurringSheet;
     $('#export-row').onclick = exportData;
     $('#import-row').onclick = () => $('#import-input').click();
     $('#import-input').onchange = importData;
@@ -462,7 +576,7 @@
   }
 
   function exportData() {
-    const payload = { exportedAt: new Date().toISOString(), settings, transactions };
+    const payload = { exportedAt: new Date().toISOString(), settings, transactions, recurring };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -486,8 +600,10 @@
         if (confirm(`Import ${data.transactions.length} transactions? This will replace your current data.`)) {
           transactions = data.transactions;
           if (data.settings) settings = Object.assign(settings, data.settings);
+          if (Array.isArray(data.recurring)) recurring = data.recurring;
           Store.save(transactions);
           Store.saveSettings(settings);
+          Store.saveRecurring(recurring);
           renderAll();
           toast('Backup restored');
         }
@@ -497,6 +613,64 @@
       e.target.value = '';
     };
     reader.readAsText(file);
+  }
+
+  /* ================= RECURRING SHEET ================= */
+  function openRecurringSheet() {
+    renderRecurringList();
+    openSheet($('#recurring-sheet'));
+  }
+
+  function renderRecurringList() {
+    const rows = recurring.length
+      ? recurring
+          .map((r) => {
+            const cat = CAT_BY_ID[r.category] || { name: r.category, emoji: '➕' };
+            const next = nextOccurrence(r, r.lastRun);
+            return `
+              <div class="recur-row ${r.active ? '' : 'paused'}" data-id="${r.id}">
+                <div class="recur-icon">${cat.emoji}</div>
+                <div class="recur-mid">
+                  <div class="recur-name">${cat.name}${r.note ? ' · ' + escapeHtml(r.note) : ''}</div>
+                  <div class="recur-sub">${freqLabel(r)} · next ${formatShortDate(next)}</div>
+                </div>
+                <div class="recur-right">
+                  <div class="recur-amount ${r.type}">${r.type === 'income' ? '+' : '-'}${fmt(r.amount)}</div>
+                  <div class="recur-actions">
+                    <label class="switch">
+                      <input type="checkbox" data-action="toggle-active" ${r.active ? 'checked' : ''}>
+                      <span class="switch-track"></span>
+                    </label>
+                    <button class="task-del" data-action="delete-rule" aria-label="Delete recurring">${trashIconSmall()}</button>
+                  </div>
+                </div>
+              </div>`;
+          })
+          .join('')
+      : emptyState('🔁', 'No recurring expenses yet. Turn on "Repeat" when adding a transaction.');
+
+    $('#recurring-list').innerHTML = rows;
+    if (!recurring.length) return;
+
+    $('#recurring-list').querySelectorAll('.recur-row').forEach((el) => {
+      const id = el.dataset.id;
+      el.querySelector('[data-action="toggle-active"]').onchange = (e) => {
+        const rule = recurring.find((r) => r.id === id);
+        rule.active = e.target.checked;
+        Store.saveRecurring(recurring);
+        renderRecurringList();
+        renderHome();
+      };
+      el.querySelector('[data-action="delete-rule"]').onclick = () => {
+        if (confirm('Stop this recurring expense? Past transactions stay in your history.')) {
+          recurring = recurring.filter((r) => r.id !== id);
+          Store.saveRecurring(recurring);
+          renderRecurringList();
+          renderHome();
+          renderSettings();
+        }
+      };
+    });
   }
 
   /* ================= FORM (sheet) ================= */
@@ -512,9 +686,13 @@
     $('#f-note').value = editing ? editing.note || '' : '';
     $('#delete-btn').style.display = editing ? 'block' : 'none';
 
+    state.formRepeat = 'none';
+    $('#repeat-field').style.display = editing ? 'none' : 'block';
+
     renderTypeToggle();
     renderCatGrid();
-    openSheet();
+    renderRepeatToggle();
+    openSheet($('#form-sheet'));
     setTimeout(() => $('#f-amount').focus(), 250);
   }
 
@@ -548,6 +726,17 @@
     });
   }
 
+  function renderRepeatToggle() {
+    $('#repeat-toggle').innerHTML = `
+      <button class="${state.formRepeat === 'none' ? 'active' : ''}" data-repeat="none">None</button>
+      <button class="${state.formRepeat === 'weekly' ? 'active' : ''}" data-repeat="weekly">Weekly</button>
+      <button class="${state.formRepeat === 'monthly' ? 'active' : ''}" data-repeat="monthly">Monthly</button>
+    `;
+    $('#repeat-toggle').querySelectorAll('button').forEach((b) => {
+      b.onclick = () => { state.formRepeat = b.dataset.repeat; renderRepeatToggle(); };
+    });
+  }
+
   function saveForm() {
     const amount = parseFloat($('#f-amount').value);
     if (!amount || amount <= 0) { toast('Enter a valid amount'); return; }
@@ -558,7 +747,7 @@
       const t = transactions.find((x) => x.id === state.editingId);
       Object.assign(t, { amount, date, note, type: state.formType, category: state.formCat });
     } else {
-      transactions.push({
+      const newTx = {
         id: uid(),
         type: state.formType,
         amount,
@@ -566,12 +755,31 @@
         date,
         note,
         createdAt: Date.now(),
-      });
+      };
+      if (state.formRepeat !== 'none') {
+        const ruleId = uid();
+        recurring.push({
+          id: ruleId,
+          type: state.formType,
+          amount,
+          category: state.formCat,
+          note,
+          frequency: state.formRepeat,
+          dayOfMonth: Number(date.split('-')[2]),
+          weekday: new Date(date + 'T00:00:00').getDay(),
+          startDate: date,
+          active: true,
+          lastRun: date,
+        });
+        Store.saveRecurring(recurring);
+        newTx.recurringId = ruleId;
+      }
+      transactions.push(newTx);
     }
     Store.save(transactions);
     closeSheet();
     renderAll();
-    toast(state.editingId ? 'Transaction updated' : 'Transaction added');
+    toast(state.editingId ? 'Transaction updated' : (state.formRepeat !== 'none' ? 'Recurring transaction added' : 'Transaction added'));
   }
 
   function deleteCurrent() {
@@ -584,13 +792,15 @@
     toast('Transaction deleted');
   }
 
-  function openSheet() {
+  function openSheet(el) {
     $('#sheet-backdrop').classList.add('open');
-    $('#form-sheet').classList.add('open');
+    el.classList.add('open');
+    state.openSheetEl = el;
   }
   function closeSheet() {
     $('#sheet-backdrop').classList.remove('open');
-    $('#form-sheet').classList.remove('open');
+    if (state.openSheetEl) state.openSheetEl.classList.remove('open');
+    state.openSheetEl = null;
     state.editingId = null;
   }
 
@@ -611,6 +821,7 @@
   function uploadIcon() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9"/><path d="M7 14l5-5 5 5"/><path d="M5 3h14"/></svg>'; }
   function trashIcon() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--red)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
   function trashIconSmall() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
+  function repeatIconSmall() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>'; }
 
   /* ================= Navigation ================= */
   function setView(v) {
@@ -642,8 +853,12 @@
     $('#form-close').onclick = closeSheet;
     $('#save-btn').onclick = saveForm;
     $('#delete-btn').onclick = deleteCurrent;
+    $('#recurring-close').onclick = closeSheet;
+
+    const generated = runRecurringEngine();
 
     setView('home');
+    if (generated > 0) toast(`${generated} recurring transaction${generated === 1 ? '' : 's'} added`);
 
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {

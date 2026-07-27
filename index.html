@@ -76,6 +76,11 @@
         <input type="date" id="f-date">
       </div>
 
+      <div class="field" id="repeat-field">
+        <label>Repeat</label>
+        <div class="repeat-toggle" id="repeat-toggle"></div>
+      </div>
+
       <div class="field">
         <label for="f-note">Note (optional)</label>
         <textarea id="f-note" maxlength="80" placeholder="e.g. weekly groceries"></textarea>
@@ -86,6 +91,15 @@
         <button class="btn primary" id="save-btn">Save</button>
       </div>
       <button class="btn danger" id="delete-btn" style="width:100%;margin-top:10px;display:none;">Delete</button>
+    </div>
+
+    <div class="sheet" id="recurring-sheet">
+      <div class="sheet-handle"></div>
+      <h2>Recurring Expenses</h2>
+      <div id="recurring-list"></div>
+      <div class="sheet-actions" style="margin-top:16px;">
+        <button class="btn ghost" id="recurring-close" style="width:100%;">Close</button>
+      </div>
     </div>
 
     <div class="toast" id="toast"></div>
