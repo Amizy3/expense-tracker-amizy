@@ -200,6 +200,298 @@
       .slice(0, limit);
   }
 
+  /* ---------------- CSV bank-statement import ---------------- */
+  const DATE_ALIASES = ['date', 'transaction date', 'posted date', 'trans date', 'post date'];
+  const DESC_ALIASES = ['description', 'memo', 'payee', 'details', 'merchant', 'name'];
+  const AMOUNT_ALIASES = ['amount', 'transaction amount'];
+  const DEBIT_ALIASES = ['debit', 'withdrawal', 'withdrawals', 'money out', 'payment'];
+  const CREDIT_ALIASES = ['credit', 'deposit', 'deposits', 'money in'];
+
+  const EXPENSE_KEYWORDS = [
+    ['groceries', ['walmart', 'kroger', 'safeway', 'whole foods', 'trader joe', 'aldi', 'publix', 'costco', 'grocery']],
+    ['housing', ['rent', 'mortgage', 'hoa']],
+    ['utilities', ['electric', 'water bill', 'gas company', 'pg&e', 'con edison', 'comcast', 'xfinity', 'internet', 'utility', 'verizon', 'at&t']],
+    ['transport', ['uber', 'lyft', 'shell', 'chevron', 'exxon', 'gas station', 'parking', 'transit', 'metro']],
+    ['dining', ['starbucks', 'mcdonald', 'chipotle', 'restaurant', 'doordash', 'grubhub', 'ubereats', 'uber eats', 'coffee', 'pizza', 'taco']],
+    ['health', ['pharmacy', 'cvs', 'walgreens', 'doctor', 'dental', 'clinic', 'hospital']],
+    ['shopping', ['amazon', 'ebay', 'best buy', 'macy', 'nike', 'target']],
+    ['subscriptions', ['netflix', 'spotify', 'hulu', 'disney+', 'subscription', 'apple.com/bill']],
+    ['debt', ['credit card payment', 'loan payment', 'student loan']],
+    ['family', ['daycare', 'tuition']],
+  ];
+  const INCOME_KEYWORDS = [
+    ['salary', ['payroll', 'direct deposit', 'salary']],
+    ['freelance', ['upwork', 'fiverr', 'invoice']],
+    ['refund', ['refund', 'reversal']],
+    ['investment', ['dividend', 'interest earned']],
+  ];
+
+  function findColumn(headers, aliases) {
+    for (let i = 0; i < headers.length; i++) {
+      if (aliases.some((a) => headers[i] === a || headers[i].includes(a))) return i;
+    }
+    return -1;
+  }
+
+  function scoreHeaderRow(row) {
+    const headers = row.map((h) => h.trim().toLowerCase());
+    let score = 0;
+    if (findColumn(headers, DATE_ALIASES) !== -1) score++;
+    if (findColumn(headers, DESC_ALIASES) !== -1) score++;
+    if (findColumn(headers, AMOUNT_ALIASES) !== -1) score++;
+    if (findColumn(headers, DEBIT_ALIASES) !== -1) score++;
+    if (findColumn(headers, CREDIT_ALIASES) !== -1) score++;
+    return score;
+  }
+
+  function parseCSV(text) {
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; } else inQuotes = false;
+        } else field += c;
+      } else if (c === '"') {
+        inQuotes = true;
+      } else if (c === ',') {
+        row.push(field); field = '';
+      } else if (c === '\n') {
+        row.push(field); rows.push(row); row = []; field = '';
+      } else if (c === '\r') {
+        // ignore; \n (or end of string) terminates the row
+      } else {
+        field += c;
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows.filter((r) => r.some((c) => c.trim() !== ''));
+  }
+
+  function parseAmount(str) {
+    if (str == null) return NaN;
+    let s = String(str).trim();
+    if (!s) return NaN;
+    let neg = false;
+    if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
+    if (/^-/.test(s)) neg = true;
+    s = s.replace(/[^0-9.]/g, '');
+    if (!s) return NaN;
+    let n = parseFloat(s);
+    if (isNaN(n)) return NaN;
+    return neg ? -Math.abs(n) : n;
+  }
+
+  function pad2(n) { return String(n).padStart(2, '0'); }
+
+  function parseDateFlexible(str) {
+    if (!str) return null;
+    const s = String(str).trim();
+    let m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+    if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
+    m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})/);
+    if (m) {
+      const [, mm, dd, yy] = m;
+      const year = yy.length === 2 ? (Number(yy) < 70 ? '20' + yy : '19' + yy) : yy;
+      return `${year}-${pad2(mm)}-${pad2(dd)}`;
+    }
+    return null;
+  }
+
+  function guessCategory(desc, isIncome) {
+    const d = (desc || '').toLowerCase();
+    const table = isIncome ? INCOME_KEYWORDS : EXPENSE_KEYWORDS;
+    for (const [cat, words] of table) {
+      if (words.some((w) => d.includes(w))) return cat;
+    }
+    return isIncome ? 'other_inc' : 'other_exp';
+  }
+
+  function importKeyFor(date, amount, description) {
+    return `${date}|${amount.toFixed(2)}|${description.toLowerCase().replace(/\s+/g, ' ').trim()}`;
+  }
+
+  function handleCsvFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const rows = parseCSV(String(reader.result));
+        if (rows.length < 2) throw new Error('empty');
+
+        let headerIdx = 0, bestScore = -1;
+        for (let i = 0; i < Math.min(3, rows.length - 1); i++) {
+          const score = scoreHeaderRow(rows[i]);
+          if (score > bestScore) { bestScore = score; headerIdx = i; }
+        }
+        const headers = rows[headerIdx].map((h) => h.trim().toLowerCase());
+        const dateIdx = findColumn(headers, DATE_ALIASES);
+        const descIdx = findColumn(headers, DESC_ALIASES);
+        const debitIdx = findColumn(headers, DEBIT_ALIASES);
+        const creditIdx = findColumn(headers, CREDIT_ALIASES);
+        const amountIdx = (debitIdx === -1 && creditIdx === -1) ? findColumn(headers, AMOUNT_ALIASES) : -1;
+
+        if (dateIdx === -1 || descIdx === -1 || (amountIdx === -1 && debitIdx === -1 && creditIdx === -1)) {
+          alert('Could not find Date, Description, and Amount columns in this file. Expected headers like "Date", "Description", and "Amount" (or "Debit"/"Credit").');
+          return;
+        }
+
+        const raw = [];
+        for (let i = headerIdx + 1; i < rows.length; i++) {
+          const r = rows[i];
+          if (!r || r.every((c) => !c || !c.trim())) continue;
+          const date = parseDateFlexible(r[dateIdx]);
+          const description = (r[descIdx] || '').trim();
+          if (!date || !description) continue;
+          let signedAmount, mode;
+          if (amountIdx !== -1) {
+            signedAmount = parseAmount(r[amountIdx]);
+            mode = 'single';
+          } else {
+            const debitVal = parseAmount(r[debitIdx]) || 0;
+            const creditVal = parseAmount(r[creditIdx]) || 0;
+            signedAmount = creditVal - Math.abs(debitVal);
+            mode = 'dc';
+          }
+          if (isNaN(signedAmount) || signedAmount === 0) continue;
+          raw.push({ date, description, signedAmount, mode });
+        }
+
+        if (!raw.length) {
+          alert('No valid transaction rows found in this file.');
+          return;
+        }
+
+        state.importRaw = raw;
+        state.importMode = raw[0].mode;
+        state.importSignFlip = false;
+        buildImportRows();
+        openImportCsvSheet();
+      } catch (err) {
+        alert('Could not read this CSV file.');
+      }
+      e.target.value = '';
+    };
+    reader.readAsText(file);
+  }
+
+  function buildImportRows() {
+    const existingKeys = new Set(transactions.filter((t) => t.importKey).map((t) => t.importKey));
+    state.importRows = state.importRaw
+      .map((r) => {
+        let type, amount;
+        if (r.mode === 'dc') {
+          type = r.signedAmount < 0 ? 'expense' : 'income';
+          amount = Math.abs(r.signedAmount);
+        } else {
+          const isExpense = state.importSignFlip ? r.signedAmount > 0 : r.signedAmount < 0;
+          type = isExpense ? 'expense' : 'income';
+          amount = Math.abs(r.signedAmount);
+        }
+        const category = guessCategory(r.description, type === 'income');
+        const importKey = importKeyFor(r.date, r.signedAmount, r.description);
+        const duplicate = existingKeys.has(importKey);
+        return { date: r.date, description: r.description, type, amount, category, importKey, duplicate, include: !duplicate };
+      })
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  function openImportCsvSheet() {
+    renderImportCsvSheet();
+    openSheet($('#import-csv-sheet'));
+  }
+
+  function renderImportCsvSheet() {
+    const dupCount = state.importRows.filter((r) => r.duplicate).length;
+
+    const signToggle = state.importMode === 'single'
+      ? `<div class="field">
+          <label>Amounts</label>
+          <div class="repeat-toggle" id="import-sign-toggle">
+            <button data-flip="false" class="${!state.importSignFlip ? 'active' : ''}">Negative = expense</button>
+            <button data-flip="true" class="${state.importSignFlip ? 'active' : ''}">Positive = expense</button>
+          </div>
+        </div>`
+      : '';
+
+    const rowsHtml = state.importRows
+      .map((r, i) => {
+        const cats = r.type === 'income' ? INCOME_CATEGORIES : EXPENSE_CATEGORIES;
+        return `
+          <div class="import-row ${r.duplicate ? 'dup' : ''}" data-idx="${i}">
+            <input type="checkbox" class="import-check" ${r.include ? 'checked' : ''}>
+            <div class="import-mid">
+              <div class="import-desc">${escapeHtml(r.description)}</div>
+              <div class="import-sub">${formatShortDate(r.date)}${r.duplicate ? ' · possible duplicate' : ''}</div>
+              <select class="import-cat">
+                ${cats.map((c) => `<option value="${c.id}" ${c.id === r.category ? 'selected' : ''}>${c.emoji} ${c.name}</option>`).join('')}
+              </select>
+            </div>
+            <div class="import-amount ${r.type}">${r.type === 'income' ? '+' : '-'}${fmt(r.amount)}</div>
+          </div>`;
+      })
+      .join('');
+
+    $('#import-csv-body').innerHTML = `
+      ${signToggle}
+      <p style="font-size:12px;color:var(--text-dim);margin:4px 0 14px;">${state.importRows.length} row${state.importRows.length === 1 ? '' : 's'} found${dupCount ? `, ${dupCount} look${dupCount === 1 ? 's' : ''} already imported (unchecked by default)` : ''}.</p>
+      <div class="import-list">${rowsHtml}</div>
+    `;
+    updateImportCount();
+
+    const signToggleWrap = $('#import-sign-toggle');
+    if (signToggleWrap) {
+      signToggleWrap.querySelectorAll('button').forEach((b) => {
+        b.onclick = () => {
+          state.importSignFlip = b.dataset.flip === 'true';
+          buildImportRows();
+          renderImportCsvSheet();
+        };
+      });
+    }
+
+    $('#import-csv-body').querySelectorAll('.import-row').forEach((el) => {
+      const idx = Number(el.dataset.idx);
+      el.querySelector('.import-check').onchange = (e) => {
+        state.importRows[idx].include = e.target.checked;
+        updateImportCount();
+      };
+      el.querySelector('.import-cat').onchange = (e) => {
+        state.importRows[idx].category = e.target.value;
+      };
+    });
+  }
+
+  function updateImportCount() {
+    const n = state.importRows.filter((r) => r.include).length;
+    $('#import-csv-confirm').textContent = `Import ${n}`;
+  }
+
+  function confirmImportCsv() {
+    const rowsToImport = state.importRows.filter((r) => r.include);
+    if (!rowsToImport.length) { toast('No rows selected'); return; }
+    rowsToImport.forEach((r) => {
+      transactions.push({
+        id: uid(),
+        type: r.type,
+        amount: r.amount,
+        category: r.category,
+        date: r.date,
+        note: r.description.slice(0, 120),
+        createdAt: Date.now(),
+        importKey: r.importKey,
+      });
+    });
+    Store.save(transactions);
+    closeSheet();
+    renderAll();
+    toast(`Imported ${rowsToImport.length} transaction${rowsToImport.length === 1 ? '' : 's'}`);
+  }
+
   /* ---------------- State ---------------- */
   const state = {
     view: 'home',
@@ -212,6 +504,10 @@
     formCat: EXPENSE_CATEGORIES[0].id,
     formRepeat: 'none',
     openSheetEl: null,
+    importRaw: [],
+    importRows: [],
+    importMode: 'single',
+    importSignFlip: false,
   };
 
   /* ---------------- DOM refs ---------------- */
@@ -540,6 +836,10 @@
           <div class="label-block"><div class="t">Recurring expenses</div><div class="d">${recurring.filter((r) => r.active).length} active · manage repeats</div></div>
           <span>${repeatIconSmall()}</span>
         </div>
+        <div class="settings-row" id="import-csv-row">
+          <div class="label-block"><div class="t">Import bank statement (CSV)</div><div class="d">Bulk-add transactions from a downloaded CSV</div></div>
+          <span>${csvIconSmall()}</span>
+        </div>
         <div class="settings-row" id="export-row">
           <div class="label-block"><div class="t">Export backup</div><div class="d">${total} transaction${total === 1 ? '' : 's'} · save as JSON file</div></div>
           <span>${downloadIcon()}</span>
@@ -554,6 +854,7 @@
         </div>
       </div>
       <input type="file" id="import-input" accept="application/json" style="display:none">
+      <input type="file" id="import-csv-input" accept=".csv,text/csv" style="display:none">
       <p style="font-size:12px;color:var(--text-dim);text-align:center;margin-top:22px;line-height:1.5;">
         All data is stored only on this device (browser local storage).<br>Nothing is uploaded anywhere. Export regularly to keep a backup.
       </p>
@@ -562,6 +863,8 @@
     $('#set-currency').onchange = (e) => { settings.currency = e.target.value; Store.saveSettings(settings); renderAll(); };
     $('#set-goal').onchange = (e) => { settings.goal = parseFloat(e.target.value) || 0; Store.saveSettings(settings); };
     $('#recurring-row').onclick = openRecurringSheet;
+    $('#import-csv-row').onclick = () => $('#import-csv-input').click();
+    $('#import-csv-input').onchange = handleCsvFile;
     $('#export-row').onclick = exportData;
     $('#import-row').onclick = () => $('#import-input').click();
     $('#import-input').onchange = importData;
@@ -822,6 +1125,7 @@
   function trashIcon() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--red)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
   function trashIconSmall() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
   function repeatIconSmall() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 1l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 23l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>'; }
+  function csvIconSmall() { return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h1"/><path d="M14 15h1"/></svg>'; }
 
   /* ================= Navigation ================= */
   function setView(v) {
@@ -854,6 +1158,8 @@
     $('#save-btn').onclick = saveForm;
     $('#delete-btn').onclick = deleteCurrent;
     $('#recurring-close').onclick = closeSheet;
+    $('#import-csv-close').onclick = closeSheet;
+    $('#import-csv-confirm').onclick = confirmImportCsv;
 
     const generated = runRecurringEngine();
 
