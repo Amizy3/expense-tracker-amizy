@@ -593,6 +593,43 @@ nav.bottom-nav button.active { color: var(--green); }
 .switch input:checked + .switch-track { background: var(--green); }
 .switch input:checked + .switch-track::before { transform: translateX(16px); }
 
+/* --- CSV import --- */
+.import-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 48vh;
+  overflow-y: auto;
+  padding-bottom: 4px;
+}
+.import-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+.import-row.dup { opacity: 0.55; }
+.import-check { width: 18px; height: 18px; flex-shrink: 0; margin-top: 3px; accent-color: var(--green); }
+.import-mid { flex: 1; min-width: 0; }
+.import-desc { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.import-sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+.import-cat {
+  margin-top: 6px;
+  width: 100%;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.import-amount { font-weight: 700; font-size: 13px; flex-shrink: 0; min-width: 60px; text-align: right; margin-top: 2px; }
+.import-amount.income { color: var(--green); }
+.import-amount.expense { color: var(--red); }
+
 .insight-box {
   background: var(--surface);
   border-radius: 14px;
